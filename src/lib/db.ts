@@ -11,10 +11,24 @@ const databaseUrl =
   rawDatabaseUrl && rawDatabaseUrl.trim() ? rawDatabaseUrl : undefined;
 
 /**
+ * Vercel / serverless production must use a real Postgres (`DATABASE_URL`).
+ * PGLite relies on WASM + a `.data` asset that Nitro does not package into the
+ * serverless function, so falling back there produces ENOENT on
+ * `/var/task/_libs/pglite.data` and a 500 for every request.
+ */
+const isServerlessProduction =
+  typeof process !== "undefined" &&
+  Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+/**
  * Active backend: real **Neon** when `DATABASE_URL` is set (deployed / configured
  * sandbox), otherwise a local embedded **PGLite** (Postgres compiled to WASM) so
  * the app has a working database even with nothing configured — the live preview
  * included. Swap in Neon later by just setting `DATABASE_URL`; no code changes.
+ *
+ * On Vercel without DATABASE_URL we still report "pglite" so the rest of the
+ * code paths stay consistent, but `createPgliteSql` throws a clear message
+ * instead of the opaque ENOENT from the missing WASM data file.
  */
 export const dbSource: DbSource = databaseUrl ? "neon" : "pglite";
 
@@ -56,29 +70,21 @@ const globalRef = globalThis as typeof globalThis & {
  * int8 -> string, date -> local-midnight Date; PGLite: int8 -> BigInt, which
  * JSON.stringify rejects, date -> UTC Date). Normalize both so preview and
  * production return identical, JSON-safe shapes:
- *   int8/bigint (incl. count(*)) -> number (past 2^53 loses precision — cast
- *                                   `::text` if you ever need huge integers)
- *   date                         -> 'YYYY-MM-DD' string
- *   interval                     -> Postgres interval text
- * numeric already comes back as a string on both (arbitrary precision).
+ *   int8/bigint (incl. count(*)) -> number
+ *   date / interval -> string (ISO text as sent by the server)
  */
 const OID_INT8 = 20;
 const OID_DATE = 1082;
 const OID_INTERVAL = 1186;
-const identity = (v: string) => v;
+const identity = <T>(v: T) => v;
 
-type Run = <T>(text: string, params: unknown[]) => Promise<T[]>;
-
-/** Wrap a query runner in the tagged-template + `.query()` `Sql` surface. */
-function toSql(run: Run): Sql {
-  const sql = (async <T = Record<string, unknown>>(
-    strings: TemplateStringsArray,
-    ...values: unknown[]
-  ): Promise<T[]> => {
-    // Rebuild with $1, $2, … placeholders so values stay parameterized.
+function toSql(
+  run: <T>(text: string, params: unknown[]) => Promise<T[]>,
+): Sql {
+  const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
     let text = strings[0];
     for (let i = 0; i < values.length; i += 1) text += `$${i + 1}${strings[i + 1]}`;
-    return run<T>(text, values);
+    return run(text, values);
   }) as unknown as Sql;
   sql.query = <T = Record<string, unknown>>(text: string, params: unknown[] = []) =>
     run<T>(text, params);
@@ -106,12 +112,26 @@ function createNeonSql(): Promise<Sql> {
 }
 
 async function createPgliteSql(): Promise<Sql> {
+  // PGLite is only viable in local/dev (and the live preview). On Vercel the
+  // WASM data file is not present in the serverless package, so refuse early
+  // with an actionable error instead of the opaque ENOENT.
+  if (isServerlessProduction) {
+    throw new Error(
+      "DATABASE_URL is not set. On Vercel this app requires a Postgres " +
+        "connection string (e.g. Neon). Set DATABASE_URL in the project " +
+        "Environment Variables, then redeploy. PGLite cannot run in the " +
+        "serverless function because its pglite.data asset is not packaged.",
+    );
+  }
+
   // Embedded Postgres, imported on demand so it never loads on the Neon path.
   // One in-memory instance per process, shared across HMR module instances, so
   // data survives source edits (it resets on dev-server restart).
   globalRef.__pgliteInstance__ ??= (async () => {
     const { PGlite } = await import("@electric-sql/pglite");
     const pg = new PGlite({
+      // Explicit in-memory FS — same as the default, but documents intent.
+      dataDir: "memory://",
       parsers: {
         [OID_INT8]: Number,
         [OID_DATE]: identity,
@@ -226,10 +246,17 @@ export function ensureDbReady(): Promise<void> {
 
 // Server-only eager start: kick PGLite bootstrap as soon as this module loads in
 // Node. Client bundles never hit this path (`getSql` throws in the browser).
+// On Vercel without DATABASE_URL we skip the eager start — the clearer error
+// from createPgliteSql will surface on the first request instead of crashing
+// module evaluation with an opaque ENOENT.
 const globalBoot = globalThis as typeof globalThis & {
   __pgBootstrapPromise__?: Promise<void>;
 };
-if (typeof window === "undefined" && dbSource === "pglite") {
+if (
+  typeof window === "undefined" &&
+  dbSource === "pglite" &&
+  !isServerlessProduction
+) {
   globalBoot.__pgBootstrapPromise__ ??= ensureDbReady().catch((err) => {
     globalBoot.__pgBootstrapPromise__ = undefined;
     console.error("[db] PGLite bootstrap failed:", err);
